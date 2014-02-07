@@ -7,6 +7,7 @@ require 'base64'
 require 'yaml'
 require 'logger'
 require 'dependo'
+require 'json'
 
 module R509
   module CertificateAuthority
@@ -101,6 +102,90 @@ module R509
           end
 
           crl(params[:ca]).generate_crl.to_pem
+        end
+
+        post '/1/p12/issue/?' do
+          content_type :json
+
+          log.info "Issue certificate and create a PKCS12 file"
+          raw = request.env["rack.input"].read
+          env["rack.input"].rewind
+          log.info raw
+
+          log.info params.inspect
+
+          if not params.has_key?("ca")
+            raise ArgumentError, "Must provide a CA"
+          end
+          if not ca(params["ca"])
+            raise ArgumentError, "CA not found"
+          end
+          if not params.has_key?("profile")
+            raise ArgumentError, "Must provide a CA profile"
+          end
+          if not params.has_key?("validityPeriod")
+            raise ArgumentError, "Must provide a validity period"
+          end
+
+          subject = subject_parser.parse(raw, "subject")
+          log.info subject.inspect
+          log.info subject.to_s
+          if subject.empty?
+            raise ArgumentError, "Must provide a subject"
+          end
+
+          extensions = []
+          if params.has_key?("extensions") and params["extensions"].has_key?("subjectAlternativeName")
+            san_names = params["extensions"]["subjectAlternativeName"].select { |name| not name.empty? }
+            if not san_names.empty?
+              extensions.push(R509::Cert::Extensions::SubjectAlternativeName.new(:value => R509::ASN1.general_name_parser(san_names)))
+            end
+          elsif params.has_key?("extensions") and params["extensions"].has_key?("dNSNames")
+            san_names = R509::ASN1::GeneralNames.new
+            params["extensions"]["dNSNames"].select{ |name| not name.empty? }.each do |name|
+              san_names.create_item(:tag => 2, :value => name.strip)
+            end
+            if not san_names.names.empty?
+              extensions.push(R509::Cert::Extensions::SubjectAlternativeName.new(:value => san_names))
+            end
+          end
+
+          validity_period = validity_period_converter.convert(params["validityPeriod"])
+
+          log.info "Generate a private key" 
+          key = R509::PrivateKey.new(:type => "RSA", :bit_length => 2048)
+
+          log.info "Generate a certificate signing request" 
+          csr = R509::CSR.new(
+            :key => key,
+            :subject => {
+              :CN => subject["CN"],
+              :O => subject["O"],
+              :L => subject["L"],
+              :ST => subject["ST"],
+              :C => subject["C"]
+            }
+          )
+
+          signer_opts = builder(params["ca"]).build_and_enforce(
+            :csr => csr,
+            :profile_name => params["profile"],
+            :subject => subject,
+            :extensions => extensions,
+            :message_digest => params["message_digest"],
+            :not_before => validity_period[:not_before],
+            :not_after => validity_period[:not_after],
+          )
+
+          cert = ca(params["ca"]).sign(signer_opts)
+
+          pem = cert.to_pem
+          log.info pem
+
+          cert = R509::Cert.new(:cert => cert, :key => key)
+          cert.write_pkcs12("output.p12", "")
+
+          pem
         end
 
         post '/1/certificate/issue/?' do
